@@ -47,21 +47,34 @@ def ct2_model_name(model: str) -> str:
 
 # One loaded model per name for the process lifetime — loading dominates
 # the cost of transcribing many short slices.
-_fw_models: dict[str, object] = {}
+_fw_models: dict[tuple[str, bool], object] = {}
+# Set once a CUDA attempt failed (e.g. GPU present but cublas64_*.dll absent):
+# all further slices go straight to CPU instead of failing again.
+_force_cpu = False
 
 
-def _faster_whisper_model(model: str):
+def _is_cuda_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(k in text for k in ("cublas", "cudnn", "cuda", "hip"))
+
+
+def _faster_whisper_model(model: str, cpu: bool = False):
     from faster_whisper import WhisperModel
 
     name = ct2_model_name(model)
-    wm = _fw_models.get(name)
+    key = (name, cpu)
+    wm = _fw_models.get(key)
     if wm is None:
-        try:
-            wm = WhisperModel(name, device="auto", compute_type="auto")
-        except (ValueError, RuntimeError):
-            # e.g. no float16 support on this CPU — int8 runs everywhere.
+        if cpu:
             wm = WhisperModel(name, device="cpu", compute_type="int8")
-        _fw_models[name] = wm
+        else:
+            try:
+                wm = WhisperModel(name, device="auto", compute_type="auto")
+            except (ValueError, RuntimeError):
+                # e.g. no float16 support, or CUDA runtime absent — int8 CPU
+                # runs everywhere.
+                return _faster_whisper_model(model, cpu=True)
+        _fw_models[key] = wm
     return wm
 
 
@@ -78,9 +91,23 @@ def transcribe_slice(wav_path: str, model: str, language: str | None,
         return (result.get("text") or "").strip()
 
     if backend == "faster-whisper":
-        wm = _faster_whisper_model(model)
-        segments, _info = wm.transcribe(  # type: ignore[attr-defined]
-            wav_path, language=language, condition_on_previous_text=False)
-        return " ".join(s.text.strip() for s in segments).strip()
+        global _force_cpu
+        wm = _faster_whisper_model(model, cpu=_force_cpu)
+        try:
+            segments, _info = wm.transcribe(  # type: ignore[attr-defined]
+                wav_path, language=language, condition_on_previous_text=False)
+            # The generator is lazy: consume it here so CUDA failures surface.
+            return " ".join(s.text.strip() for s in segments).strip()
+        except RuntimeError as exc:
+            # GPU visible mais runtime CUDA absent (ex. cublas64_12.dll
+            # introuvable) : repli CPU définitif pour ce processus.
+            if _force_cpu or not _is_cuda_error(exc):
+                raise
+            print("  CUDA indisponible (" + str(exc).splitlines()[0] + ") — repli CPU int8")
+            _force_cpu = True
+            wm = _faster_whisper_model(model, cpu=True)
+            segments, _info = wm.transcribe(  # type: ignore[attr-defined]
+                wav_path, language=language, condition_on_previous_text=False)
+            return " ".join(s.text.strip() for s in segments).strip()
 
     raise ValueError(f"unknown backend: {backend!r}")
