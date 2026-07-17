@@ -45,6 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from transcribe_local import DEFAULT_MODEL, whisper_to_scribe  # noqa: E402
+from whisper_backends import BACKENDS, resolve_backend, transcribe_slice  # noqa: E402
 
 
 def probe_duration(video: Path) -> float:
@@ -81,9 +82,9 @@ def merge_windows(markers: list[dict], before: float, after: float,
 
 
 def transcribe_window(video: Path, start: float, end: float,
-                      model: str, language: str | None) -> str:
+                      model: str, language: str | None,
+                      backend: str) -> str:
     """Windowed transcription: extract the audio slice, run whisper on it."""
-    import mlx_whisper
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "slice.wav"
         subprocess.run(
@@ -91,12 +92,7 @@ def transcribe_window(video: Path, start: float, end: float,
              "-t", f"{end - start:.2f}", "-vn", "-ac", "1", "-ar", "16000",
              "-c:a", "pcm_s16le", str(wav)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        opts: dict = {"word_timestamps": False, "verbose": None,
-                      "condition_on_previous_text": False}
-        if language:
-            opts["language"] = language
-        result = mlx_whisper.transcribe(str(wav), path_or_hf_repo=model, **opts)
-    return (result.get("text") or "").strip()
+        return transcribe_slice(str(wav), model, language, backend)
 
 
 def main() -> None:
@@ -111,6 +107,9 @@ def main() -> None:
     ap.add_argument("--language", type=str, default=None,
                     help="ISO code for windowed transcription (default: auto)")
     ap.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    ap.add_argument("--backend", type=str, default="auto", choices=BACKENDS,
+                    help="Transcription backend: mlx (Apple Silicon), "
+                         "faster-whisper (portable), auto = mlx if available")
     ap.add_argument("--no-transcript", action="store_true",
                     help="Skip windowed transcription entirely")
     ap.add_argument("--edit-dir", type=Path, default=None)
@@ -128,6 +127,10 @@ def main() -> None:
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
     out_dir = edit_dir / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = resolve_backend(args.backend) if not args.no_transcript else "none"
+    if backend != "none":
+        print(f"  transcription backend: {backend}")
 
     vod_duration = probe_duration(video)
     clips = merge_windows(markers, args.before, args.after, vod_duration)
@@ -151,7 +154,7 @@ def main() -> None:
         transcript = ""
         if not args.no_transcript:
             transcript = transcribe_window(video, c["start"], c["end"],
-                                           args.model, args.language)
+                                           args.model, args.language, backend)
         manifest.append({
             "file": name,
             "start": round(c["start"], 2),
