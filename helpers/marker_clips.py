@@ -12,7 +12,9 @@ Design decisions (validated 2026-07-15):
   - transcription runs ONLY inside each window (mlx-whisper on the audio
     slice) — no full-VOD transcription, keeps processing to minutes
   - clips are delivered as-is (source aspect/quality, frame-accurate cuts);
-    no diarization, no subtitles, no LLM — zero tokens, no HF gate needed
+    no diarization, no burned-in subtitles, no LLM — zero tokens, no HF gate
+    needed. A sidecar .srt (clip-relative cues, from the same whisper pass) is
+    written alongside each clip for the host app to toggle/burn as it wishes.
 
 Markers JSON format (list, seconds relative to VOD start):
 [
@@ -23,8 +25,11 @@ Markers JSON format (list, seconds relative to VOD start):
 
 Output: <edit>/clips_markers/
   clip_{NN}_{slug}.mp4        one per (merged) marker window
+  clip_{NN}_{slug}.srt        SRT for that clip — timestamps relative to the
+                              clip start (clip = 0), one cue per whisper
+                              segment; omitted with --no-transcript / when empty
   manifest.json               [{file, start, end, duration_s, markers:[...],
-                               title, transcript}]
+                               title, transcript, srt?}]   (srt is additive)
 
 Usage:
     .venv/bin/python helpers/marker_clips.py <vod.mp4> --markers markers.json
@@ -45,7 +50,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from transcribe_local import DEFAULT_MODEL, whisper_to_scribe  # noqa: E402
-from whisper_backends import BACKENDS, resolve_backend, transcribe_slice  # noqa: E402
+from whisper_backends import BACKENDS, resolve_backend, transcribe_slice_segments  # noqa: E402
 
 
 def probe_duration(video: Path) -> float:
@@ -60,6 +65,33 @@ def slug(text: str, max_len: int = 40) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return text[:max_len] or "marker"
+
+
+def _srt_timestamp(seconds: float) -> str:
+    """SRT time code HH:MM:SS,mmm (mirrors render._srt_timestamp)."""
+    total_ms = max(0, int(round(seconds * 1000)))
+    h, rem = divmod(total_ms, 3600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def segments_to_srt(segments: list[dict]) -> str:
+    """Standard SRT from whisper segments (times already clip-relative).
+
+    One cue per non-empty segment — no merge/split — blocks separated by a
+    blank line, cue index recomputed so skipped empty segments leave no gap.
+    Returns "" when there is nothing to write.
+    """
+    blocks: list[str] = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = _srt_timestamp(seg.get("start", 0.0))
+        end = _srt_timestamp(seg.get("end", 0.0))
+        blocks.append(f"{len(blocks) + 1}\n{start} --> {end}\n{text}")
+    return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
 def merge_windows(markers: list[dict], before: float, after: float,
@@ -83,8 +115,12 @@ def merge_windows(markers: list[dict], before: float, after: float,
 
 def transcribe_window(video: Path, start: float, end: float,
                       model: str, language: str | None,
-                      backend: str) -> str:
-    """Windowed transcription: extract the audio slice, run whisper on it."""
+                      backend: str) -> list[dict]:
+    """Windowed transcription: extract the audio slice, run whisper on it.
+
+    Returns the whisper segments (times clip-relative — the slice begins at 0),
+    from which both the flat transcript and the sidecar SRT are built.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "slice.wav"
         subprocess.run(
@@ -92,7 +128,7 @@ def transcribe_window(video: Path, start: float, end: float,
              "-t", f"{end - start:.2f}", "-vn", "-ac", "1", "-ar", "16000",
              "-c:a", "pcm_s16le", str(wav)],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return transcribe_slice(str(wav), model, language, backend)
+        return transcribe_slice_segments(str(wav), model, language, backend)
 
 
 def main() -> None:
@@ -151,11 +187,13 @@ def main() -> None:
                  "-crf", str(args.crf), "-c:a", "aac", "-b:a", "192k",
                  "-movflags", "+faststart", str(dest)],
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        transcript = ""
+        segments: list[dict] = []
         if not args.no_transcript:
-            transcript = transcribe_window(video, c["start"], c["end"],
-                                           args.model, args.language, backend)
-        manifest.append({
+            segments = transcribe_window(video, c["start"], c["end"],
+                                         args.model, args.language, backend)
+        transcript = " ".join(s["text"] for s in segments if s.get("text")).strip()
+
+        entry = {
             "file": name,
             "start": round(c["start"], 2),
             "end": round(c["end"], 2),
@@ -163,7 +201,17 @@ def main() -> None:
             "markers": c["markers"],
             "title": title,
             "transcript": transcript,
-        })
+        }
+
+        # Sidecar SRT next to the clip — clip-relative cues, one per whisper
+        # segment. Additive manifest field; manifests without it stay valid.
+        srt_text = segments_to_srt(segments)
+        if srt_text:
+            srt_name = Path(name).with_suffix(".srt").name
+            (out_dir / srt_name).write_text(srt_text, encoding="utf-8")
+            entry["srt"] = srt_name
+
+        manifest.append(entry)
         quote = (transcript[:60] + "…") if len(transcript) > 60 else transcript
         print(f"  {name} ({dur:.0f}s) — {quote or 'no transcript'}")
 

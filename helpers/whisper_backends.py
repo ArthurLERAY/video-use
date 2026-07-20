@@ -81,6 +81,22 @@ def _faster_whisper_model(model: str, cpu: bool = False):
 def transcribe_slice(wav_path: str, model: str, language: str | None,
                      backend: str) -> str:
     """Transcribe one extracted 16 kHz mono WAV slice, return plain text."""
+    return " ".join(
+        seg["text"]
+        for seg in transcribe_slice_segments(wav_path, model, language, backend)
+        if seg["text"]
+    ).strip()
+
+
+def transcribe_slice_segments(wav_path: str, model: str, language: str | None,
+                              backend: str) -> list[dict]:
+    """Transcribe one 16 kHz mono WAV slice, return the whisper segments as
+    ``[{"start": float, "end": float, "text": str}]`` (text stripped).
+
+    Times are relative to the slice start (the slice already begins at 0), so
+    for marker clips they are clip-relative. One entry per whisper segment —
+    no merge/split. Callers build SRT cues or plain text straight from these.
+    """
     if backend == "mlx":
         import mlx_whisper
         opts: dict = {"word_timestamps": False, "verbose": None,
@@ -88,7 +104,12 @@ def transcribe_slice(wav_path: str, model: str, language: str | None,
         if language:
             opts["language"] = language
         result = mlx_whisper.transcribe(wav_path, path_or_hf_repo=model, **opts)
-        return (result.get("text") or "").strip()
+        return [
+            {"start": float(seg.get("start", 0.0)),
+             "end": float(seg.get("end", 0.0)),
+             "text": (seg.get("text") or "").strip()}
+            for seg in result.get("segments", [])
+        ]
 
     if backend == "faster-whisper":
         global _force_cpu
@@ -97,7 +118,7 @@ def transcribe_slice(wav_path: str, model: str, language: str | None,
             segments, _info = wm.transcribe(  # type: ignore[attr-defined]
                 wav_path, language=language, condition_on_previous_text=False)
             # The generator is lazy: consume it here so CUDA failures surface.
-            return " ".join(s.text.strip() for s in segments).strip()
+            return _fw_segments(segments)
         except RuntimeError as exc:
             # GPU visible mais runtime CUDA absent (ex. cublas64_12.dll
             # introuvable) : repli CPU définitif pour ce processus.
@@ -108,6 +129,14 @@ def transcribe_slice(wav_path: str, model: str, language: str | None,
             wm = _faster_whisper_model(model, cpu=True)
             segments, _info = wm.transcribe(  # type: ignore[attr-defined]
                 wav_path, language=language, condition_on_previous_text=False)
-            return " ".join(s.text.strip() for s in segments).strip()
+            return _fw_segments(segments)
 
     raise ValueError(f"unknown backend: {backend!r}")
+
+
+def _fw_segments(segments) -> list[dict]:
+    """Materialise a faster-whisper segment generator into plain dicts."""
+    return [
+        {"start": float(s.start), "end": float(s.end), "text": s.text.strip()}
+        for s in segments
+    ]
